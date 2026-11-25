@@ -667,7 +667,7 @@
           </div>
 
           <button id="btnRunSvm" type="button" class="w-full py-2.5 rounded bg-ink-900 dark:bg-white hover:opacity-90 text-white dark:text-ink-900 text-xs font-semibold transition inline-flex items-center justify-center gap-2">
-            <i data-lucide="play" class="w-3.5 h-3.5"></i> Re-Evaluate SVM Prediction
+            <i data-lucide="play" class="w-3.5 h-3.5"></i> <span>Re-Evaluate SVM Prediction</span>
           </button>
         </div>
       </div>
@@ -682,7 +682,7 @@
             <strong>Exact Spectrum of T (Eq. 4):</strong> <span id="pyEigenvals" class="font-mono text-cobalt-700 dark:text-blue-400">Computing...</span>
           </div>
           <div class="text-xs text-ink-700 dark:text-[#C5C2BB]">
-            <strong>Real 10-Fold SVM CV:</strong> <span id="pyCvReadout" class="font-mono font-bold text-forest-700 dark:text-teal-400">Pending</span>
+            <strong>Real 10-Fold SVM CV:</strong> <span id="pyCvReadout" role="status" class="font-mono font-bold text-forest-700 dark:text-teal-400">Pending</span>
           </div>
         </div>
         <div class="lg:col-span-7 space-y-2.5">
@@ -2503,7 +2503,6 @@
       document.getElementById('btnCompareStar').addEventListener('click', () => { state.compareStar = !state.compareStar; document.getElementById('compareStarPanel').classList.toggle('hidden', !state.compareStar); if (state.compareStar) renderLab(); });
       document.getElementById('btnCopyVector').addEventListener('click', () => { const rwf = computeRWF(state.nodes, state.edges, state.partitionMode, state.k, state.tauC, state.useNodeFeatures); copyText(JSON.stringify({ method: state.partitionMode.toUpperCase(), k: rwf.groups.length, tau_c: state.tauC, dimension: rwf.flatVector.length, fingerprint: rwf.flatVector.map(v => Number(v.toFixed(4))) }, null, 2)); });
       document.getElementById('svmCSelect').addEventListener('change', (e) => { state.svmC = Number(e.target.value); renderLab(); });
-      document.getElementById('btnRunSvm').addEventListener('click', () => { renderLab(); showToast('SVM prediction updated.', 'success'); });
 
       document.querySelectorAll('.rq1-filter-btn').forEach(btn => btn.addEventListener('click', () => {
         state.rq1Filter = btn.dataset.rq1Filter;
@@ -2572,6 +2571,22 @@
       payload() {
         return { nodes: state.nodes, edges: state.edges, mode: state.partitionMode, k: state.k, tau_c: state.tauC, use_node_features: state.useNodeFeatures };
       },
+      async post(path, payload, timeoutMs) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const response = await fetch(path, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            signal: controller.signal
+          });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return await response.json();
+        } finally {
+          clearTimeout(timeout);
+        }
+      },
       async syncFingerprint() {
         if (!this.online) return;
         try {
@@ -2585,18 +2600,26 @@
         } catch (e) {}
       },
       async runRealSvm() {
-        if (!this.online) return;
+        const button = document.getElementById('btnRunSvm');
+        const label = button.querySelector('span');
+        const cvEl = document.getElementById('pyCvReadout');
+        if (button.disabled) return;
+        if (!this.online) {
+          cvEl.textContent = 'Backend unavailable. Reload the page and try again.';
+          showToast(cvEl.textContent, 'warn');
+          return;
+        }
+        const ds = state.presetKey === 'reddit' ? 'reddit-mini' : 'mutag-mini';
+        button.disabled = true;
+        label.textContent = 'Evaluating…';
+        cvEl.textContent = 'Running SVM and 10-fold validation…';
         try {
-          const ds = state.presetKey === 'reddit' ? 'reddit-mini' : 'mutag-mini';
-          const res = await fetch('/api/svm/classify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...this.payload(), C: state.svmC, dataset_name: ds }) });
-          if (!res.ok) return;
-          const data = await res.json();
+          const data = await this.post('/api/svm/classify', { ...this.payload(), C: state.svmC, dataset_name: ds }, 60000);
           const isClass1 = data.predicted_class === 1;
           document.getElementById('svmPredLabel').textContent = data.predicted_label;
           document.getElementById('svmConfVal').textContent = `${data.confidence_pct}% conf`;
           document.getElementById('svmConfBar').style.width = `${Math.min(99, Math.max(51, data.confidence_pct))}%`;
           document.getElementById('svmConfBar').className = `h-full rounded-full transition-all duration-300 ${isClass1 ? 'bg-cobalt-700' : 'bg-sienna-700'}`;
-          const cvEl = document.getElementById('pyCvReadout');
           if (cvEl) cvEl.textContent = `${data.cv_10fold.mean_acc}% (±${data.cv_10fold.std_acc}%) on ${ds} in ${data.elapsed_ms} ms`;
 
           const svg = document.getElementById('svmSvg'), proj = data.projection_2d;
@@ -2613,7 +2636,14 @@
               <circle cx="${ux}" cy="${uy}" r="3.8" fill="#0F766E" />
               <text x="${ux}" y="${uy - 10}" text-anchor="middle" font-size="9" font-family="monospace" font-weight="700" fill="#0F766E">Live z</text>`;
           }
-        } catch (e) {}
+        } catch (error) {
+          const reason = error.name === 'AbortError' ? 'Timed out after 60 seconds' : error.message;
+          cvEl.textContent = `Evaluation failed (${reason}). Try again.`;
+          showToast(cvEl.textContent, 'warn');
+        } finally {
+          button.disabled = false;
+          label.textContent = 'Re-Evaluate SVM Prediction';
+        }
       },
       async refreshSavedGraphs() {
         if (!this.online) return;
@@ -2628,11 +2658,27 @@
         } catch (e) {}
       },
       async saveCurrentGraph() {
-        if (!this.online) { showToast('Start FastAPI server to save to SQLite.', 'warn'); return; }
-        const inp = document.getElementById('saveGraphName');
-        const name = (inp && inp.value.trim()) || `Graph ${new Date().toLocaleTimeString()}`;
-        const res = await fetch('/api/graphs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...this.payload(), name }) });
-        if (res.ok) { if (inp) inp.value = ''; showToast(`Saved "${name}" to SQLite.`, 'success'); this.refreshSavedGraphs(); }
+        if (!this.online) { showToast('Backend unavailable. Reload the page and try again.', 'warn'); return; }
+        const button = document.getElementById('btnSaveGraphDb');
+        if (button.disabled) return;
+        const input = document.getElementById('saveGraphName');
+        const enteredName = input.value;
+        const name = enteredName.trim() || `Graph ${new Date().toLocaleTimeString()}`;
+        button.disabled = true;
+        button.textContent = 'Saving…';
+        try {
+          await this.post('/api/graphs', { ...this.payload(), name }, 20000);
+          if (input.value === enteredName) input.value = '';
+          showToast(`Saved "${name}" to SQLite.`, 'success');
+          this.refreshSavedGraphs();
+        } catch (error) {
+          const reason = error.name === 'AbortError' ? 'Timed out after 20 seconds' : error.message;
+          showToast(`Save could not be confirmed (${reason}). Check the saved graphs before retrying.`, 'warn');
+          this.refreshSavedGraphs();
+        } finally {
+          button.disabled = false;
+          button.textContent = 'Save to DB';
+        }
       },
       async deleteSavedGraph(id) {
         const res = await fetch(`/api/graphs/${id}`, { method: 'DELETE' });

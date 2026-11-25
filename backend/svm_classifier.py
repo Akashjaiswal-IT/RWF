@@ -10,6 +10,7 @@ runs out of the box with zero extra dependencies.
 from __future__ import annotations
 
 import time
+from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -186,6 +187,23 @@ def evaluate_kfold_cv(
     return float(np.mean(accs)), float(np.std(accs)), [round(a, 1) for a in accs]
 
 
+@lru_cache(maxsize=64)
+def _trained_model(
+    dataset_name: str, mode: str, k: int, tau_c: int, use_node_features: bool, C: float
+):
+    """Reuse training and cross-validation for identical benchmark settings."""
+    graphs, y, class_names = generate_benchmark_dataset(dataset_name=dataset_name, n_graphs=40, seed=42)
+    X_list = [
+        compute_rwf(g["nodes"], g["edges"], mode=mode, k=k, tau_c=tau_c, use_node_features=use_node_features, include_matrices=False)["fingerprint"]
+        for g in graphs
+    ]
+    X = np.array(X_list, dtype=np.float64)
+
+    model = SoftMarginSVM(C=C).fit(X, y)
+    cross_validation = evaluate_kfold_cv(X, y, C=C, n_folds=10)
+    return X, y, class_names, model, cross_validation
+
+
 def classify_user_graph(
     nodes: List[Dict[str, Any]],
     edges: List[List[str]],
@@ -196,25 +214,19 @@ def classify_user_graph(
     C: float = 1.0,
     dataset_name: str = "mutag-mini",
 ) -> Dict[str, Any]:
-    """Train a real SVM on the benchmark dataset using the user's exact RWF settings and classify the user's graph."""
+    """Classify a graph with a real SVM trained using its RWF settings."""
     t0 = time.perf_counter()
-    graphs, y, class_names = generate_benchmark_dataset(dataset_name=dataset_name, n_graphs=40, seed=42)
-    X_list = [
-        compute_rwf(g["nodes"], g["edges"], mode=mode, k=k, tau_c=tau_c, use_node_features=use_node_features, include_matrices=False)["fingerprint"]
-        for g in graphs
-    ]
-    X = np.array(X_list, dtype=np.float64)
+    X, y, class_names, clf, (cv_mean, cv_std, fold_accs) = _trained_model(
+        dataset_name, mode, k, tau_c, use_node_features, C
+    )
 
     user_rwf = compute_rwf(nodes, edges, mode=mode, k=k, tau_c=tau_c, use_node_features=use_node_features, include_matrices=False)
     x_user = np.array([user_rwf["fingerprint"]], dtype=np.float64)
 
-    clf = SoftMarginSVM(C=C).fit(X, y)
     score = float(clf.decision_function(x_user)[0])
     prob_pos = float(clf.predict_proba_positive(x_user)[0])
     pred_class = 1 if score >= 0.0 else 0
     confidence = (prob_pos if pred_class == 1 else (1.0 - prob_pos)) * 100.0
-
-    cv_mean, cv_std, fold_accs = evaluate_kfold_cv(X, y, C=C, n_folds=10)
 
     # 2D projection of training points + user graph
     all_pts = project_2d_pca(np.vstack([X, x_user]))
@@ -232,7 +244,7 @@ def classify_user_graph(
         "cv_10fold": {
             "mean_acc": round(cv_mean, 1),
             "std_acc": round(cv_std, 1),
-            "fold_accs": fold_accs,
+            "fold_accs": fold_accs.copy(),
         },
         "projection_2d": {
             "class0": train_pts_0,
